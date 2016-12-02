@@ -6,6 +6,7 @@
 package main
 
 import (
+	"C"
 	"archive/zip"
 	"bytes"
 	"crypto"
@@ -87,7 +88,56 @@ func (z zipReader) ReadAt(p []byte, pos int64) (int, error) {
 	return copy(p, []byte(z)[int(pos):]), nil
 }
 
-func fetch() bool {
+//export getCurrentVersionFromPython
+func getCurrentVersionFromPython() bool {
+	var buffer bytes.Buffer
+	returnValue := getCurrentVersion(&buffer)
+
+	writeBufferToFile("/tmp/crlset-verison", buffer)
+	return returnValue
+}
+
+func getCurrentVersion(writer io.Writer) bool {
+	resp, err := http.Get(buildVersionRequestURL())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get current version \n")
+		return false
+	}
+
+	var reply update
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read version reply \n")
+		return false
+	}
+	if err := xml.Unmarshal(bodyBytes, &reply); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to parse version reply \n")
+		return false
+	}
+
+	var version string
+	for _, app := range reply.Apps {
+		if app.AppId == crlSetAppId {
+			version = app.UpdateCheck.Version
+			break
+		}
+	}
+
+	fmt.Fprintf(writer, version)
+	return true
+}
+
+//export fetchFromPython
+func fetchFromPython() bool {
+	var buffer bytes.Buffer
+	returnValue := fetch(&buffer)
+
+	writeBufferToFile("/tmp/crlset", buffer)
+	return returnValue
+}
+
+func fetch(writer io.Writer) bool {
 	resp, err := http.Get(buildVersionRequestURL())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get current version: %s\n", err)
@@ -227,7 +277,7 @@ func fetch() bool {
 	}
 	defer crlSetReader.Close()
 
-	io.Copy(os.Stdout, crlSetReader)
+	io.Copy(writer, crlSetReader)
 
 	return true
 }
@@ -239,7 +289,20 @@ type crlSetHeader struct {
 	BlockedSPKIs []string
 }
 
-func dump(filename, certificateFilename string) bool {
+//export dumpFromPython
+func dumpFromPython(cFilename, cCertificateFilename *C.char) bool {
+	var buffer bytes.Buffer
+	
+	filename := C.GoString(cFilename)
+	certificateFilename := C.GoString(cCertificateFilename)
+	returnValue := dump(filename, certificateFilename, &buffer)
+
+	writeBufferToFile("/tmp/crlset-dump", buffer)
+	return returnValue
+}
+
+func dump(filename, certificateFilename string, writer io.Writer) bool {
+
 	header, c, ok := getHeader(filename)
 	if !ok {
 		return false
@@ -249,7 +312,7 @@ func dump(filename, certificateFilename string) bool {
 	if len(certificateFilename) > 0 {
 		certBytes, err := ioutil.ReadFile(certificateFilename)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to read certificate: %s\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to read certificate \n")
 			return false
 		}
 
@@ -262,7 +325,7 @@ func dump(filename, certificateFilename string) bool {
 
 		cert, err := x509.ParseCertificate(derBytes)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to parse certificate: %s\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to parse certificate \n")
 			return false
 		}
 
@@ -272,9 +335,9 @@ func dump(filename, certificateFilename string) bool {
 	}
 
 	if len(spki) == 0 {
-		fmt.Printf("Sequence: %d\n", header.Sequence)
-		fmt.Printf("Parents: %d\n", header.NumParents)
-		fmt.Printf("\n")
+		fmt.Fprintf(writer, "Sequence: %d\n", header.Sequence)
+		fmt.Fprintf(writer, "Parents: %d\n", header.NumParents)
+		fmt.Fprintf(writer, "\n")
 	}
 
 	for len(c) > 0 {
@@ -285,7 +348,7 @@ func dump(filename, certificateFilename string) bool {
 		}
 		spkiMatches := bytes.Equal(spki, c[:spkiHashLen])
 		if len(spki) == 0 {
-			fmt.Printf("%x\n", c[:spkiHashLen])
+			fmt.Fprintf(writer, "%x\n", c[:spkiHashLen])
 		}
 		c = c[spkiHashLen:]
 
@@ -310,9 +373,9 @@ func dump(filename, certificateFilename string) bool {
 			}
 
 			if len(spki) == 0 {
-				fmt.Printf("  %x\n", c[:serialLen])
+				fmt.Fprintf(writer, "  %x\n", c[:serialLen])
 			} else if spkiMatches {
-				fmt.Printf("%x\n", c[:serialLen])
+				fmt.Fprintf(writer, "%x\n", c[:serialLen])
 			}
 			c = c[serialLen:]
 		}
@@ -321,7 +384,18 @@ func dump(filename, certificateFilename string) bool {
 	return true
 }
 
-func dumpSPKIs(filename string) bool {
+//export dumpSPKIFromPython
+func dumpSPKIFromPython(cFilename *C.char) bool{
+	var buffer bytes.Buffer
+
+	filename := C.GoString(cFilename)
+	returnValue := dumpSPKIs(filename,&buffer)
+
+	writeBufferToFile("/tmp/crlset-dumpSPKI", buffer)
+	return returnValue
+}
+
+func dumpSPKIs(filename string, writer io.Writer) bool {
 	header, _, ok := getHeader(filename)
 	if !ok {
 		return false
@@ -332,16 +406,27 @@ func dumpSPKIs(filename string) bool {
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "CRLSet has an invalid blocked SPKI")
 		}
-		fmt.Printf("%s\n", hex.EncodeToString(spkiBytes))
+		fmt.Fprintln(writer, "%s\n", hex.EncodeToString(spkiBytes))
 	}
 
+	return true
+}
+
+func writeBufferToFile(filename string, buffer bytes.Buffer) bool {
+	outputFile, err := os.Create(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "failed to create output file \n")
+		return false
+	}
+	defer outputFile.Close()
+	outputFile.WriteString(buffer.String())
 	return true
 }
 
 func getHeader(filename string) (header crlSetHeader, rest []byte, ok bool) {
 	c, err := ioutil.ReadFile(filename)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read CRLSet: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to read CRLSet\n")
 		return
 	}
 
@@ -369,7 +454,7 @@ func getHeader(filename string) (header crlSetHeader, rest []byte, ok bool) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "%s: { fetch | dumpSPKIs <filename> | dump <filename> [<cert filename>] }\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "%s: { fetch | dumpSPKIs <filename> | dump <filename> [<cert filename>] | currentVersion }\n", os.Args[0])
 }
 
 func main() {
@@ -384,21 +469,26 @@ func main() {
 	switch os.Args[1] {
 	case "fetch":
 		if len(os.Args) == 2 {
-			result = fetch()
+			result = fetch(os.Stdout)
 			needUsage = false
 		}
 	case "dump":
 		if len(os.Args) == 3 {
 			needUsage = false
-			result = dump(os.Args[2], "")
+			result = dump(os.Args[2], "", os.Stdout)
 		} else if len(os.Args) == 4 {
 			needUsage = false
-			result = dump(os.Args[2], os.Args[3])
+			result = dump(os.Args[2], os.Args[3], os.Stdout)
 		}
 	case "dumpSPKIs":
 		if len(os.Args) == 3 {
 			needUsage = false
-			result = dumpSPKIs(os.Args[2])
+			result = dumpSPKIs(os.Args[2], os.Stdout)
+		}
+	case "currentVersion":
+		if len(os.Args) == 2 {
+			needUsage = false
+			result = getCurrentVersion(os.Stdout)
 		}
 	}
 
